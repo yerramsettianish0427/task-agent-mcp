@@ -1,87 +1,22 @@
-# Task Agent MCP
+# task-agent-mcp
 
-An autonomous task decomposition and execution agent exposed via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io). Give it a high-level engineering goal — it plans the work, executes each step, verifies nothing broke, and commits the results.
+An MCP server that takes a coding goal for a Python project, asks Claude to
+split it into subtasks, has Claude rewrite the relevant files for each one,
+and runs pytest after every subtask. If the tests pass it commits, otherwise
+it puts the files back.
 
-## What It Does
-
-```
-You: "Add error handling to all API calls in my RAG pipeline"
-
-Agent:
-  1. Scans your codebase
-  2. Decomposes into subtasks:
-     - "Add try/except to embeddings.py fetch call"
-     - "Add retry logic to vector search in retriever.py"
-     - "Add timeout handling to API client"
-     - "Write tests for error handling paths"
-  3. Executes each subtask (generates and applies code changes)
-  4. Runs your test suite after each change
-  5. Commits if tests pass, rolls back if they don't
-  6. Reports: 3/4 subtasks committed, 1 rolled back
-```
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                    MCP Client                        │
-│           (Claude Desktop / Cursor / VS Code)        │
-└──────────────────┬───────────────────────────────────┘
-                   │ JSON-RPC over stdio
-┌──────────────────▼───────────────────────────────────┐
-│                Task Agent MCP Server                 │
-│                                                      │
-│  ┌─────────┐  ┌───────────┐  ┌──────────┐           │
-│  │  scan    │  │  plan     │  │ execute  │           │
-│  │ project  │  │  task     │  │  task    │           │
-│  └─────────┘  └───────────┘  └────┬─────┘           │
-│                                    │                 │
-│               ┌────────────────────▼──────────────┐  │
-│               │     Execution Pipeline            │  │
-│               │                                   │  │
-│               │  decompose → identify_files →     │  │
-│               │  generate_fix → write → test →    │  │
-│               │  commit OR rollback               │  │
-│               └────────────────────┬──────────────┘  │
-│                                    │                 │
-│         ┌──────────────────────────┼──────────┐      │
-│         ▼                          ▼          ▼      │
-│   ┌──────────┐              ┌──────────┐ ┌────────┐ │
-│   │ Anthropic│              │   Git    │ │ pytest │  │
-│   │   API    │              │          │ │        │  │
-│   └──────────┘              └──────────┘ └────────┘  │
-└──────────────────────────────────────────────────────┘
-```
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `scan_project` | List all Python files in a project with line counts |
-| `plan_task` | Decompose a goal into subtasks without executing (preview mode) |
-| `execute_task` | Full pipeline: decompose → execute → verify → commit/rollback |
-| `check_status` | Check progress of a running task |
-| `rollback_all` | Emergency rollback to pre-task state |
-
-## Setup
-
-### Prerequisites
-- Python 3.10+
-- An [Anthropic API key](https://console.anthropic.com/)
-- Git (for commit/rollback features)
-
-### Install
+## Install and run
 
 ```bash
 git clone https://github.com/yerramsettianish0427/task-agent-mcp.git
 cd task-agent-mcp
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY="your-key-here"
+export ANTHROPIC_API_KEY=...
+python task_agent_mcp.py
 ```
 
-### Connect to Claude Desktop
-
-Add to your `claude_desktop_config.json`:
+It talks MCP over stdio, so normally a client starts it. For Claude Desktop,
+add this to `claude_desktop_config.json`:
 
 ```json
 {
@@ -89,61 +24,35 @@ Add to your `claude_desktop_config.json`:
     "task-agent": {
       "command": "python",
       "args": ["/absolute/path/to/task_agent_mcp.py"],
-      "env": {
-        "ANTHROPIC_API_KEY": "your-key-here"
-      }
+      "env": { "ANTHROPIC_API_KEY": "..." }
     }
   }
 }
 ```
 
-Config location:
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-- **Windows MSIX**: `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json`
+The tools are `scan_project`, `plan_task` (subtasks only, no edits),
+`execute_task`, `check_status` and `rollback_all`.
 
-### Connect to Cursor
+## Example
 
-Settings → MCP → Add Server → stdio → command: `python /absolute/path/to/task_agent_mcp.py`
+Listing the tools from an MCP client and calling `check_status` before any
+task has run:
 
-## Usage Examples
+```
+tools: ['scan_project', 'plan_task', 'execute_task', 'check_status', 'rollback_all']
+check_status: {"status": "idle", "message": "No active task"}
+```
 
-**Preview a plan:**
-> "Plan how to add type hints to my project at /Users/me/my-project"
+`execute_task` returns JSON with each subtask, the files it touched, whether
+the tests passed, and whether it was committed, rolled back or skipped.
 
-**Execute autonomously:**
-> "Execute task: add comprehensive error handling to /Users/me/rag-system"
+## Limits
 
-**Check progress:**
-> "What's the status of the current task?"
-
-**Emergency stop:**
-> "Roll back all changes"
-
-## How It Works
-
-1. **Scan** — Discovers all Python files, builds a file map with line counts
-2. **Decompose** — Claude analyzes your codebase context and breaks the goal into 4-8 ordered subtasks
-3. **Identify** — For each subtask, Claude picks which files need to change
-4. **Generate** — Claude reads the current code and produces the complete updated file
-5. **Write** — Agent writes the new code, snapshotting the original for rollback
-6. **Verify** — Runs `pytest` to check nothing broke
-7. **Commit or Rollback** — If tests pass, commits with `[TaskAgent] subtask description`. If tests fail, restores the original file.
-
-## Key Design Decisions
-
-- **Per-subtask rollback**: Each subtask is atomic. A failure in subtask 4 doesn't undo subtasks 1-3.
-- **File snapshots over git stash**: Snapshots are more reliable for partial rollbacks across multiple files.
-- **Claude as planner AND executor**: The same model decomposes tasks and generates code, ensuring consistency between plan and execution.
-- **Stdio transport**: Runs as a subprocess of the client. No ports, no URLs, no deployment — just a pipe.
-
-## Tech Stack
-
-- **MCP SDK** (FastMCP) — Protocol compliance, tool discovery, JSON-RPC
-- **Anthropic API** — Task decomposition, code generation, file identification
-- **subprocess** — Git operations, test execution
-- **pathlib** — Cross-platform file I/O with rollback support
-
-## License
-
-MIT
+- The target project needs a git repo and a pytest suite. If pytest fails or
+  finds no tests, every subtask gets rolled back.
+- Planning only sees the first 800 characters of the five largest files, and
+  Claude returns whole files rather than diffs.
+- Python files only, one task at a time, and `execute_task` blocks until it
+  finishes, so `check_status` is mostly useful afterwards.
+- `rollback_all` discards uncommitted changes. It doesn't undo commits.
+- The model is hard-coded (`claude-sonnet-5-5`).
